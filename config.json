@@ -1,0 +1,6 @@
+{
+    "serve_path": "/home/robit/Documents/repositories/phone-twins-mkcert-https",
+    "extra_dns_sans": [],
+    "cert_mode": "mkcert",
+    "mkcert_install": true
+}
