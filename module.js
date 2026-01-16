@@ -1,0 +1,949 @@
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+
+var NL = String.fromCharCode(10);
+var wsParam = new URLSearchParams(location.search).get("ws");
+var WS_URL = wsParam || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host);
+
+var menuEl = document.getElementById("menu");
+var menuBtn = document.getElementById("menuBtn");
+var streamBtn = document.getElementById("streamBtn");
+var calBtn = document.getElementById("calBtn");
+var calResetBtn = document.getElementById("calResetBtn");
+var sphereBtn = document.getElementById("sphereBtn");
+var camBtn = document.getElementById("camBtn");
+var pickBtn = document.getElementById("pickBtn");
+var gpsBtn = document.getElementById("gpsBtn");
+var statusEl = document.getElementById("status");
+var shareEl = document.getElementById("share");
+var peersUI = document.getElementById("peersUI");
+var selfPillsEl = document.getElementById("selfPills");
+var meIdEl = document.getElementById("meId");
+var peerCountEl = document.getElementById("peerCount");
+document.getElementById("wsUrl").textContent = WS_URL;
+
+function setStatus(s) { statusEl.textContent = s; }
+
+menuBtn.addEventListener("click", function () {
+  menuEl.classList.toggle("collapsed");
+});
+
+async function populateShareLinks() {
+  try {
+    var res = await fetch("/info", { cache: "no-store" });
+    var info = await res.json();
+    var proto = info && info.proto;
+    var port = info && info.port;
+    var ips = (info && info.ips) || [];
+    if (!ips.length) { shareEl.textContent = ""; return; }
+    var links = [];
+    for (var i = 0; i < ips.length && i < 8; i++) {
+      links.push(proto + "://" + ips[i] + ":" + port);
+    }
+    var parts = [];
+    parts.push('<div><span class="muted">Share on Wi-Fi:</span></div>');
+    for (var j = 0; j < links.length; j++) {
+      var u = links[j];
+      parts.push('<div><a href="' + u + '" style="color:var(--accent);text-decoration:none;" target="_blank" rel="noopener">' + u + '</a></div>');
+    }
+    shareEl.innerHTML = parts.join("");
+  } catch (e) {
+    shareEl.textContent = "";
+  }
+}
+populateShareLinks();
+
+// ---------- Three.js scene ----------
+var container = document.getElementById("app");
+var scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x000000, 12, 35);
+
+var camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.05, 100);
+camera.position.set(0, 15, 15);
+camera.lookAt(0, 1.2, 0);
+var mainCamera = camera;
+var activeCamera = camera;
+
+var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+var dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(5, 8, 5);
+scene.add(dir);
+
+var ground = new THREE.Mesh(
+  new THREE.CircleGeometry(20, 64),
+  new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 1, metalness: 0 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+scene.add(ground);
+
+var grid = new THREE.GridHelper(20, 20, 0x222222, 0x111111);
+grid.position.y = 0.01;
+scene.add(grid);
+
+var SPHERE_R = 6.0;
+
+var globe = new THREE.Mesh(
+  new THREE.SphereGeometry(SPHERE_R, 64, 32),
+  new THREE.MeshStandardMaterial({
+    color: 0xaaaaaa,
+    roughness: 1,
+    metalness: 0,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.35
+  })
+);
+globe.visible = false;
+scene.add(globe);
+
+var anchorMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.12, 16, 12),
+  new THREE.MeshStandardMaterial({ color: 0xffae00, roughness: 0.3, metalness: 0.1 })
+);
+anchorMarker.visible = false;
+scene.add(anchorMarker);
+
+var raycaster = new THREE.Raycaster();
+var pointerNdc = new THREE.Vector2();
+
+var phoneGeom = new THREE.BoxGeometry(0.6, 1.2, 0.08);
+var ORIGIN = new THREE.Vector3(0,0,0);
+
+function makePhoneTwin(accent) {
+  var group = new THREE.Group();
+  var mat = new THREE.MeshStandardMaterial({
+    color: accent ? 0xffae00 : 0xffffff,
+    roughness: accent ? 0.25 : 0.65,
+    metalness: 0.05,
+    emissive: 0x000000
+  });
+  var mesh = new THREE.Mesh(phoneGeom, mat);
+  group.add(mesh);
+
+  var fwd = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), ORIGIN, 1.0, accent ? 0xffae00 : 0xffffff);
+  group.add(fwd);
+
+  var ax = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), ORIGIN, 0.001, accent ? 0xffae00 : 0xffffff);
+  var ay = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), ORIGIN, 0.001, accent ? 0xffae00 : 0xffffff);
+  var az = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), ORIGIN, 0.001, accent ? 0xffae00 : 0xffffff);
+  group.add(ax, ay, az);
+
+  return { group: group, mesh: mesh, fwd: fwd, accelArrows: { ax: ax, ay: ay, az: az } };
+}
+
+var local = makePhoneTwin(true);
+local.group.position.set(0, 1.0, 0);
+scene.add(local.group);
+
+var phoneCamera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.05, 100);
+phoneCamera.position.set(0, 0.1, -0.25);
+local.group.add(phoneCamera);
+
+// Labels
+var labels = [];
+function makeLabelEl(text) {
+  var el = document.createElement("div");
+  el.className = "label";
+  el.textContent = text;
+  document.body.appendChild(el);
+  return el;
+}
+function registerLabel(id, object3D, initialText) {
+  var el = makeLabelEl(initialText);
+  labels.push({ id: id, el: el, object3D: object3D });
+  return el;
+}
+function updateLabels() {
+  var v = new THREE.Vector3();
+  for (var i = 0; i < labels.length; i++) {
+    var item = labels[i];
+    v.setFromMatrixPosition(item.object3D.matrixWorld);
+    v.project(activeCamera);
+    var visible = v.z < 1 && v.z > -1 && Math.abs(v.x) <= 1.2 && Math.abs(v.y) <= 1.2;
+    item.el.style.display = visible ? "block" : "none";
+    if (!visible) continue;
+    var x = (v.x * 0.5 + 0.5) * window.innerWidth;
+    var y = (-v.y * 0.5 + 0.5) * window.innerHeight;
+    item.el.style.left = x + "px";
+    item.el.style.top  = y + "px";
+  }
+}
+
+// Peer placement
+function hashTo01(str) {
+  var h = 2166136261;
+  for (var i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967295;
+}
+function peerPosition(id) {
+  var t = hashTo01(id);
+  var angle = t * Math.PI * 2;
+  var radius = 4.0;
+  return new THREE.Vector3(Math.cos(angle) * radius, 1.0, Math.sin(angle) * radius);
+}
+function grayFromId(id) {
+  var t = hashTo01(id);
+  var g = 0.35 + t * 0.45;
+  return new THREE.Color(g, g, g);
+}
+
+// ---------- math/helpers ----------
+var NORTH_POLE = new THREE.Vector3(0, 1, 0);
+var FALLBACK_REF = new THREE.Vector3(0, 0, -1);
+
+function latLonToUp(latDeg, lonDeg) {
+  var d = Math.PI / 180;
+  var phi = (90 - latDeg) * d;
+  var theta = lonDeg * d;
+  var sinPhi = Math.sin(phi);
+
+  var x = sinPhi * Math.sin(theta);
+  var y = Math.cos(phi);
+  var z = -sinPhi * Math.cos(theta);
+
+  var v = new THREE.Vector3(x, y, z);
+  if (v.lengthSq() < 1e-12) return new THREE.Vector3(0, 1, 0);
+  return v.normalize();
+}
+
+function computeTangentFrameFromUp(upVec) {
+  var up = upVec.clone().normalize();
+
+  var east = new THREE.Vector3().crossVectors(NORTH_POLE, up);
+  if (east.lengthSq() < 1e-10) {
+    east.crossVectors(FALLBACK_REF, up);
+  }
+  east.normalize();
+
+  var north = new THREE.Vector3().crossVectors(up, east).normalize();
+
+  var zAxis = north.clone().multiplyScalar(-1);
+
+  var m = new THREE.Matrix4().makeBasis(east, up, zAxis);
+  var q = new THREE.Quaternion().setFromRotationMatrix(m);
+
+  return { up: up, east: east, north: north, q: q };
+}
+
+function wrapRad(a) {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
+function headingFromQuaternion(q) {
+  var top = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+  top.y = 0;
+  var m = top.length();
+  if (m < 1e-4) return null;
+  top.multiplyScalar(1 / m);
+  var deg = Math.atan2(top.x, -top.z) * 180 / Math.PI;
+  deg = (deg + 360) % 360;
+  return deg;
+}
+
+function updateAccelArrows(accelArrows, acc) {
+  var SCALE = 0.08;
+  var MAX = 1.1;
+  var MIN_VIS = 0.12;
+  var comps = [
+    ["ax", acc && acc.x, new THREE.Vector3(1,0,0)],
+    ["ay", acc && acc.y, new THREE.Vector3(0,1,0)],
+    ["az", acc && acc.z, new THREE.Vector3(0,0,1)],
+  ];
+  for (var i = 0; i < comps.length; i++) {
+    var k = comps[i][0];
+    var v = comps[i][1];
+    var axis = comps[i][2];
+    var ar = accelArrows[k];
+    if (!ar) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || Math.abs(v) < MIN_VIS) {
+      ar.setLength(0.001);
+      ar.visible = false;
+      continue;
+    }
+    ar.visible = true;
+    var dirv = axis.clone().multiplyScalar(v >= 0 ? 1 : -1);
+    var len = Math.min(MAX, Math.abs(v) * SCALE);
+    ar.setDirection(dirv.normalize());
+    ar.setLength(Math.max(0.02, len));
+  }
+}
+
+function compassHeadingFromEuler(alpha, beta, gamma) {
+  var degtorad = Math.PI / 180;
+  var a = alpha * degtorad;
+  var b = beta  * degtorad;
+  var g = gamma * degtorad;
+  var cA = Math.cos(a), sA = Math.sin(a);
+  var sB = Math.sin(b);
+  var cG = Math.cos(g), sG = Math.sin(g);
+  var rA = -cA * sG - sA * sB * cG;
+  var rB = -sA * sG + cA * sB * cG;
+  var heading = Math.atan2(rA, rB);
+  if (heading < 0) heading += 2 * Math.PI;
+  return heading * 180 / Math.PI;
+}
+
+// DeviceOrientationControls-style quaternion
+var zee = new THREE.Vector3(0, 0, 1);
+var euler = new THREE.Euler();
+var q0 = new THREE.Quaternion();
+var q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+function screenOrientationRad() {
+  var a = (screen.orientation && typeof screen.orientation.angle === "number")
+    ? screen.orientation.angle
+    : (typeof window.orientation === "number" ? window.orientation : 0);
+  return a * Math.PI / 180;
+}
+function deviceEulerToQuaternion(alpha, beta, gamma, orientRad) {
+  var degtorad = Math.PI / 180;
+  euler.set(beta * degtorad, alpha * degtorad, -gamma * degtorad, "YXZ");
+  var q = new THREE.Quaternion().setFromEuler(euler);
+  q.multiply(q1);
+  q.multiply(q0.setFromAxisAngle(zee, -orientRad));
+  return q;
+}
+
+// ---------- state ----------
+var myId = null;
+var ws = null;
+var streaming = false;
+var usePhoneCamera = false;
+
+var sphereMode = false;
+var pickMode = false;
+
+var anchorUp = new THREE.Vector3(0, 1, 0);
+var anchorFrame = computeTangentFrameFromUp(anchorUp);
+
+function setAnchorFromUp(upVec) {
+  anchorUp.copy(upVec).normalize();
+  anchorFrame = computeTangentFrameFromUp(anchorUp);
+
+  anchorMarker.position.copy(anchorFrame.up).multiplyScalar(SPHERE_R);
+  anchorMarker.visible = sphereMode;
+}
+
+function applyLocalVisual() {
+  if (!sphereMode) {
+    local.group.position.set(0, 1.0, 0);
+    local.group.quaternion.copy(my.qDisp);
+    return;
+  }
+  local.group.position.copy(anchorFrame.up).multiplyScalar(SPHERE_R);
+  local.group.quaternion.copy(anchorFrame.q).multiply(my.qDisp);
+}
+
+var my = {
+  qRaw: new THREE.Quaternion(),
+  qOffset: new THREE.Quaternion(),
+  qDisp: new THREE.Quaternion(),
+  heading: null,
+  headingAcc: null,
+  acc: null,
+  accG: null,
+  gps: null,
+  t: Date.now(),
+  hz: 0,
+  seq: 0,
+  lastSendPerf: 0,
+  dirty: false
+};
+
+var peers = new Map();
+
+function ensurePeer(id, state) {
+  if (id === myId) return;
+  if (peers.has(id)) return;
+  var twin = makePhoneTwin(false);
+  twin.group.position.copy(peerPosition(id));
+  twin.mesh.material.color.copy(grayFromId(id));
+  var base = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.25, 0.25, 0.05, 24),
+    new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 1, metalness: 0 })
+  );
+  base.position.y = -0.8;
+  twin.group.add(base);
+  scene.add(twin.group);
+  var labelEl = registerLabel(id, twin.group, id.slice(0,8) + "..");
+  peers.set(id, { state: state || {}, twin: twin, labelEl: labelEl, hz: 0, lastRecvPerf: 0 });
+}
+
+function removePeer(id) {
+  var p = peers.get(id);
+  if (!p) return;
+  scene.remove(p.twin.group);
+  for (var i = labels.length - 1; i >= 0; i--) {
+    if (labels[i].id === id) { labels[i].el.remove(); labels.splice(i, 1); }
+  }
+  peers.delete(id);
+}
+
+function applyPeerVisual(id, p) {
+  if (!p || !p.twin) return;
+
+  var st = p.state || {};
+  var qFlat = null;
+  if (st.q) qFlat = new THREE.Quaternion(st.q.x, st.q.y, st.q.z, st.q.w);
+
+  if (!sphereMode) {
+    if (!p.basePos) p.basePos = peerPosition(id);
+    p.twin.group.position.copy(p.basePos);
+    if (qFlat) p.twin.group.quaternion.copy(qFlat);
+    return;
+  }
+
+  var up = null;
+  if (st.gps && typeof st.gps.lat === "number" && typeof st.gps.lon === "number") {
+    up = latLonToUp(st.gps.lat, st.gps.lon);
+  } else {
+    if (!p.basePos) p.basePos = peerPosition(id);
+    up = p.basePos.clone();
+    up.y = 0;
+    if (up.lengthSq() < 1e-10) up.set(0, 0, -1);
+    up.normalize();
+  }
+
+  var fr = computeTangentFrameFromUp(up);
+  p.twin.group.position.copy(fr.up).multiplyScalar(SPHERE_R);
+
+  if (qFlat) {
+    p.twin.group.quaternion.copy(fr.q).multiply(qFlat);
+  }
+}
+
+function applyPeerState(id, st) {
+  ensurePeer(id, st);
+  var p = peers.get(id);
+  if (!p) return;
+  var now = performance.now();
+  if (p.lastRecvPerf) {
+    var instHz = 1000 / Math.max(1, now - p.lastRecvPerf);
+    p.hz = p.hz ? (p.hz * 0.85 + instHz * 0.15) : instHz;
+  }
+  p.lastRecvPerf = now;
+  p.state = Object.assign({}, p.state, st);
+  applyPeerVisual(id, p);
+  updateAccelArrows(p.twin.accelArrows, p.state.acc);
+  var head = fmtHeading(p.state.heading);
+  var gps = p.state.gps ? (p.state.gps.lat.toFixed(4) + "," + p.state.gps.lon.toFixed(4)) : "-";
+  var time = fmtTime(p.state.t);
+  p.labelEl.textContent = id.slice(0,8) + "...  |  " + head + "  |  " + time + "  |  " + gps;
+}
+
+// ---------- WebSocket ----------
+function connectWS() {
+  return new Promise(function (resolve, reject) {
+    ws = new WebSocket(WS_URL);
+    ws.addEventListener("open", function () {
+      setStatus("Connected to " + WS_URL + NL + "Awaiting welcome...");
+      resolve();
+    });
+    ws.addEventListener("message", function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === "welcome") {
+        myId = msg.id;
+        meIdEl.textContent = myId.slice(0,8) + "...";
+        setStatus("Connected." + NL + "Your id: " + myId + NL + "Streaming: ON");
+        var arr = msg.peers || [];
+        for (var i = 0; i < arr.length; i++) {
+          var st = arr[i];
+          if (st && st.id) applyPeerState(st.id, st);
+        }
+        peerCountEl.textContent = String(peers.size);
+      }
+      if (msg.type === "join" && msg.peer && msg.peer.id) {
+        applyPeerState(msg.peer.id, msg.peer);
+        peerCountEl.textContent = String(peers.size);
+      }
+      if (msg.type === "leave" && msg.id) {
+        removePeer(msg.id);
+        peerCountEl.textContent = String(peers.size);
+      }
+      if (msg.type === "peer_update" && msg.peer && msg.peer.id) {
+        applyPeerState(msg.peer.id, msg.peer);
+      }
+    });
+    ws.addEventListener("close", function () { setStatus("Disconnected."); });
+    ws.addEventListener("error", function () { setStatus("WebSocket error."); reject(new Error("WebSocket error")); });
+  });
+}
+
+function safeSend(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  if (ws.bufferedAmount > 1000000) return false;
+  try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+}
+
+function markDirtyAndSend() {
+  my.dirty = true;
+  sendUpdate();
+}
+
+function sendUpdate() {
+  if (!streaming) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!my.dirty) return;
+
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  applyLocalVisual();
+
+  var nowPerf = performance.now();
+  if (my.lastSendPerf) {
+    var instHz = 1000 / Math.max(1, nowPerf - my.lastSendPerf);
+    my.hz = my.hz ? (my.hz * 0.85 + instHz * 0.15) : instHz;
+  }
+  my.lastSendPerf = nowPerf;
+
+  my.t = Date.now();
+  my.seq++;
+
+  var payload = {
+    type: "update",
+    state: {
+      ts: Date.now(),
+      t: my.t,
+      hz: Math.round(my.hz),
+      seq: my.seq,
+      q: { x: my.qDisp.x, y: my.qDisp.y, z: my.qDisp.z, w: my.qDisp.w },
+      heading: my.heading,
+      headingAcc: my.headingAcc,
+      acc: my.acc,
+      accG: my.accG,
+      gps: my.gps
+    }
+  };
+  var ok = safeSend(payload);
+  if (ok) my.dirty = false;
+}
+
+// ---------- Sensors ----------
+var geoWatchId = null;
+var orientationListening = false;
+var motionListening = false;
+
+async function requestPermissions() {
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+    var r1 = await DeviceOrientationEvent.requestPermission();
+    if (r1 !== "granted") throw new Error("Orientation permission denied");
+  }
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+    var r2 = await DeviceMotionEvent.requestPermission();
+    if (r2 !== "granted") throw new Error("Motion permission denied");
+  }
+}
+
+function startGeolocation() {
+  if (!("geolocation" in navigator)) return;
+  if (geoWatchId != null) return;
+  geoWatchId = navigator.geolocation.watchPosition(
+    function (pos) {
+      var c = pos.coords;
+      my.gps = { lat: c.latitude, lon: c.longitude, acc: (c.accuracy == null ? 0 : c.accuracy) };
+      markDirtyAndSend();
+    },
+    function (err) { setStatus("GPS error: " + err.message); },
+    { enableHighAccuracy: true, maximumAge: 250, timeout: 15000 }
+  );
+}
+function stopGeolocation() {
+  if (geoWatchId == null) return;
+  try { navigator.geolocation.clearWatch(geoWatchId); } catch (e) {}
+  geoWatchId = null;
+}
+
+function onDeviceOrientation(ev) {
+  if (ev.alpha == null || ev.beta == null || ev.gamma == null) return;
+  my.qRaw.copy(deviceEulerToQuaternion(ev.alpha, ev.beta, ev.gamma, screenOrientationRad()));
+
+  var heading = null;
+  var headingAcc = null;
+  if (typeof ev.webkitCompassHeading === "number" && ev.webkitCompassHeading >= 0) {
+    heading = ev.webkitCompassHeading;
+    if (typeof ev.webkitCompassAccuracy === "number") headingAcc = ev.webkitCompassAccuracy;
+  } else if (ev.absolute === true) {
+    heading = compassHeadingFromEuler(ev.alpha, ev.beta, ev.gamma);
+  }
+  my.heading = (typeof heading === "number" && Number.isFinite(heading)) ? ((heading % 360) + 360) % 360 : null;
+  my.headingAcc = (typeof headingAcc === "number" && Number.isFinite(headingAcc)) ? headingAcc : null;
+
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  applyLocalVisual();
+  updateAccelArrows(local.accelArrows, my.acc);
+  markDirtyAndSend();
+}
+
+var WORLD_G = new THREE.Vector3(0, -9.81, 0);
+function computeLinearAccelFallbackFromAccG(accG, qRaw) {
+  if (!accG) return null;
+  if (typeof accG.x !== "number" || typeof accG.y !== "number" || typeof accG.z !== "number") return null;
+  var inv = qRaw.clone().invert();
+  var gDevice = WORLD_G.clone().applyQuaternion(inv);
+  return { x: accG.x + gDevice.x, y: accG.y + gDevice.y, z: accG.z + gDevice.z };
+}
+
+function onDeviceMotion(ev) {
+  var a = ev.acceleration;
+  var ag = ev.accelerationIncludingGravity;
+  if (ag && typeof ag.x === "number" && typeof ag.y === "number" && typeof ag.z === "number") {
+    my.accG = { x: ag.x, y: ag.y, z: ag.z };
+  }
+  if (a && typeof a.x === "number" && typeof a.y === "number" && typeof a.z === "number") {
+    my.acc = { x: a.x, y: a.y, z: a.z };
+  } else if (my.accG) {
+    var lin = computeLinearAccelFallbackFromAccG(my.accG, my.qRaw);
+    if (lin) my.acc = lin;
+  }
+  updateAccelArrows(local.accelArrows, my.acc);
+  markDirtyAndSend();
+}
+
+function startSensorListeners() {
+  if (!orientationListening) {
+    window.addEventListener("deviceorientation", onDeviceOrientation, true);
+    window.addEventListener("deviceorientationabsolute", onDeviceOrientation, true);
+    orientationListening = true;
+  }
+  if (!motionListening) {
+    window.addEventListener("devicemotion", onDeviceMotion, true);
+    motionListening = true;
+  }
+  try {
+    if ("AbsoluteOrientationSensor" in window) {
+      var s1 = new AbsoluteOrientationSensor({ frequency: 1000 });
+      s1.addEventListener("reading", function () {
+        var q = s1.quaternion;
+        if (q && q.length === 4) {
+          my.qRaw.set(q[0], q[1], q[2], q[3]);
+          my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+          applyLocalVisual();
+          markDirtyAndSend();
+        }
+      });
+      s1.start();
+    }
+  } catch (e) {}
+  try {
+    if ("LinearAccelerationSensor" in window) {
+      var s2 = new LinearAccelerationSensor({ frequency: 1000 });
+      s2.addEventListener("reading", function () {
+        my.acc = { x: s2.x, y: s2.y, z: s2.z };
+        updateAccelArrows(local.accelArrows, my.acc);
+        markDirtyAndSend();
+      });
+      s2.start();
+    }
+  } catch (e2) {}
+  try {
+    if ("Accelerometer" in window) {
+      var s3 = new Accelerometer({ frequency: 1000 });
+      s3.addEventListener("reading", function () {
+        my.accG = { x: s3.x, y: s3.y, z: s3.z };
+        markDirtyAndSend();
+      });
+      s3.start();
+    }
+  } catch (e3) {}
+}
+
+function stopSensorListeners() {
+  if (orientationListening) {
+    window.removeEventListener("deviceorientation", onDeviceOrientation, true);
+    window.removeEventListener("deviceorientationabsolute", onDeviceOrientation, true);
+    orientationListening = false;
+  }
+  if (motionListening) {
+    window.removeEventListener("devicemotion", onDeviceMotion, true);
+    motionListening = false;
+  }
+}
+
+// ---------- Manual yaw calibration ----------
+function calibrateYawOnce() {
+  if (my.heading == null) {
+    setStatus("Calibrate: no compass heading yet. Ensure HTTPS + allow motion. Try a figure-8.");
+    return;
+  }
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  var currentH = headingFromQuaternion(my.qDisp);
+  if (currentH == null) {
+    setStatus("Calibrate: heading undefined (device nearly vertical). Tilt flatter and try again.");
+    return;
+  }
+  var targetH = ((my.heading % 360) + 360) % 360;
+  var deltaDeg = ((targetH - currentH + 540) % 360) - 180;
+  var deltaRad = wrapRad(deltaDeg * Math.PI / 180);
+  var qDelta = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -deltaRad);
+  my.qOffset.premultiply(qDelta);
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  applyLocalVisual();
+  markDirtyAndSend();
+  setStatus("Calibrated yaw." + NL + "Compass: " + targetH.toFixed(1) + "deg" + NL + "Delta: " + deltaDeg.toFixed(1) + "deg");
+}
+
+function resetYawCalibration() {
+  my.qOffset.identity();
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  applyLocalVisual();
+  markDirtyAndSend();
+  setStatus("Yaw calibration reset.");
+}
+
+calBtn.addEventListener("click", calibrateYawOnce);
+calResetBtn.addEventListener("click", resetYawCalibration);
+
+sphereBtn.addEventListener("click", function () {
+  sphereMode = !sphereMode;
+
+  globe.visible = sphereMode;
+  anchorMarker.visible = sphereMode;
+
+  sphereBtn.textContent = sphereMode ? "Back to plane" : "Project to sphere";
+
+  if (sphereMode) {
+    if (my.gps && typeof my.gps.lat === "number" && typeof my.gps.lon === "number") {
+      setAnchorFromUp(latLonToUp(my.gps.lat, my.gps.lon));
+    } else {
+      setAnchorFromUp(anchorUp);
+    }
+    setStatus("Sphere mode: ON. Up is radial. North is toward +Y pole on tangent plane.");
+  } else {
+    setStatus("Sphere mode: OFF (plane).");
+  }
+
+  applyLocalVisual();
+  peers.forEach(function (p, id) { applyPeerVisual(id, p); });
+});
+
+camBtn.addEventListener("click", function () {
+  usePhoneCamera = !usePhoneCamera;
+  activeCamera = usePhoneCamera ? phoneCamera : mainCamera;
+  camBtn.textContent = usePhoneCamera ? "Main camera" : "Phone camera";
+  setStatus(usePhoneCamera ? "Camera: phone" : "Camera: main");
+});
+
+pickBtn.addEventListener("click", function () {
+  if (!sphereMode) {
+    sphereMode = true;
+    globe.visible = true;
+    anchorMarker.visible = true;
+    sphereBtn.textContent = "Back to plane";
+  }
+  pickMode = true;
+  setStatus("Pick mode: tap the globe (or hold Shift and tap).");
+});
+
+gpsBtn.addEventListener("click", function () {
+  if (!my.gps) {
+    setStatus("Use GPS: no fix yet. Start streaming + allow location.");
+    return;
+  }
+  setAnchorFromUp(latLonToUp(my.gps.lat, my.gps.lon));
+  setStatus("Anchor set from GPS: " + my.gps.lat.toFixed(4) + "," + my.gps.lon.toFixed(4));
+  applyLocalVisual();
+});
+
+// ---------- UI helpers ----------
+function esc(s) {
+  return String(s).replace(/[&<>\\"]/g, function (c) {
+    var map = { "&": "&", "<": "<", ">": ">", "\"": "\"" };
+    return map[c] || c;
+  });
+}
+function pill(text, accent) {
+  return "<span class=\"pill " + (accent ? "accent" : "") + "\">" + esc(text) + "</span>";
+}
+function fmtN(n, d) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "-";
+  return n.toFixed(d == null ? 2 : d);
+}
+function fmtHeading(h) {
+  if (typeof h !== "number" || !Number.isFinite(h)) return "-";
+  var x = ((h % 360) + 360) % 360;
+  return x.toFixed(1) + "deg";
+}
+function fmtGps(g) {
+  if (!g) return "-";
+  return g.lat.toFixed(5) + "," + g.lon.toFixed(5) + " +/-" + Math.round(g.acc || 0) + "m";
+}
+function fmtTime(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "-";
+  return new Date(ms).toLocaleTimeString();
+}
+
+var lastUiPerf = 0;
+function renderUI() {
+  var now = performance.now();
+  if (now - lastUiPerf < 80) return;
+  lastUiPerf = now;
+
+  var eOff = new THREE.Euler().setFromQuaternion(my.qOffset, "YXZ");
+  var yawOff = eOff.y * 180 / Math.PI;
+
+  var self = [];
+  self.push(pill("id=" + (myId ? (myId.slice(0,8) + "...") : "-"), true));
+  self.push(pill("hz=" + Math.round(my.hz || 0), false));
+  self.push(pill("t=" + fmtTime(my.t), false));
+  self.push(pill("heading=" + fmtHeading(my.heading), true));
+  if (typeof my.headingAcc === "number") self.push(pill("acc=" + fmtN(my.headingAcc,0) + "deg", false));
+  self.push(pill("yawOff=" + (Number.isFinite(yawOff) ? yawOff.toFixed(1) : "-") + "deg", false));
+  if (my.gps) self.push(pill("gps=" + fmtGps(my.gps), false));
+  if (my.acc) {
+    self.push(pill("ax=" + fmtN(my.acc.x,2), false));
+    self.push(pill("ay=" + fmtN(my.acc.y,2), false));
+    self.push(pill("az=" + fmtN(my.acc.z,2), false));
+  }
+  selfPillsEl.innerHTML = self.join("");
+
+  var blocks = [];
+  peers.forEach(function (p, id) {
+    var st = p.state || {};
+    var pillsOut = [];
+    pillsOut.push(pill("hz=" + Math.round(p.hz || 0), false));
+    pillsOut.push(pill("t=" + fmtTime(st.t), false));
+    pillsOut.push(pill("heading=" + fmtHeading(st.heading), true));
+    if (typeof st.headingAcc === "number" && st.headingAcc >= 0) pillsOut.push(pill("acc=" + fmtN(st.headingAcc,0) + "deg", false));
+    if (st.gps) pillsOut.push(pill("gps=" + fmtGps(st.gps), false));
+    if (st.acc) {
+      pillsOut.push(pill("ax=" + fmtN(st.acc.x,2), false));
+      pillsOut.push(pill("ay=" + fmtN(st.acc.y,2), false));
+      pillsOut.push(pill("az=" + fmtN(st.acc.z,2), false));
+    }
+    blocks.push(
+      "<div class=\"peerBlock\">" +
+        "<div class=\"peerHeader\">" +
+          "<span>" + esc(id.slice(0,8) + "...") + "</span>" +
+          "<span class=\"muted\">seq=" + esc(st.seq == null ? "-" : st.seq) + "</span>" +
+        "</div>" +
+        "<div class=\"pillbox\">" + pillsOut.join("") + "</div>" +
+      "</div>"
+    );
+  });
+  peersUI.innerHTML = blocks.length ? blocks.join("") : "<div class=\"muted tiny\">No peers yet.</div>";
+  peerCountEl.textContent = String(peers.size);
+}
+
+// ---------- Stream toggle ----------
+async function startStreaming() {
+  if (streaming) return;
+  streaming = true;
+  streamBtn.textContent = "Stop streaming";
+
+  setStatus("Requesting permissions...");
+  await requestPermissions();
+
+  setStatus("Starting sensors...");
+  startSensorListeners();
+  startGeolocation();
+
+  setStatus("Connecting WebSocket...");
+  await connectWS();
+
+  registerLabel("me", local.group, "You");
+  setStatus("Connected." + NL + "Your id: " + (myId || "(pending)") + NL + "Streaming: ON");
+}
+
+function stopStreaming() {
+  streaming = false;
+  streamBtn.textContent = "Start streaming";
+  stopSensorListeners();
+  stopGeolocation();
+  try { if (ws) ws.close(); } catch (e) {}
+  ws = null;
+  setStatus("Streaming: OFF");
+}
+
+streamBtn.addEventListener("click", async function () {
+  try {
+    if (!streaming) await startStreaming();
+    else stopStreaming();
+  } catch (e) {
+    setStatus("Start failed: " + (e && e.message ? e.message : String(e)));
+    streaming = false;
+    streamBtn.textContent = "Start streaming";
+  }
+});
+
+// Desktop drag fallback
+function pickAnchorFromClientXY(cx, cy) {
+  var rect = renderer.domElement.getBoundingClientRect();
+  var nx = ((cx - rect.left) / rect.width) * 2 - 1;
+  var ny = -(((cy - rect.top) / rect.height) * 2 - 1);
+
+  pointerNdc.set(nx, ny);
+  raycaster.setFromCamera(pointerNdc, activeCamera);
+
+  var hits = raycaster.intersectObject(globe, false);
+  if (!hits || !hits.length) {
+    setStatus("Pick: no hit. Tap the sphere wireframe.");
+    return;
+  }
+
+  var p = hits[0].point.clone();
+  if (p.lengthSq() < 1e-12) return;
+
+  setAnchorFromUp(p.normalize());
+  applyLocalVisual();
+
+  pickMode = false;
+  setStatus("Anchor set by pick. Sphere mode: ON.");
+}
+
+var dragging = false;
+var lastX = 0, lastY = 0;
+renderer.domElement.addEventListener("pointerdown", function (e) {
+  if (sphereMode && (pickMode || e.shiftKey)) {
+    pickAnchorFromClientXY(e.clientX, e.clientY);
+    return;
+  }
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
+window.addEventListener("pointerup", function () { dragging = false; });
+window.addEventListener("pointermove", function (e) {
+  if (!dragging) return;
+  var dx = (e.clientX - lastX) / window.innerWidth;
+  var dy = (e.clientY - lastY) / window.innerHeight;
+  lastX = e.clientX; lastY = e.clientY;
+  var yaw = -dx * Math.PI * 1.6;
+  var pitch = -dy * Math.PI * 1.2;
+  var qYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw);
+  var qPitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), pitch);
+  my.qRaw.multiply(qYaw).multiply(qPitch);
+  my.qDisp.copy(my.qOffset).multiply(my.qRaw);
+  applyLocalVisual();
+  markDirtyAndSend();
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (!sphereMode) {
+    local.group.position.y = 1.0 + Math.sin(Date.now() * 0.0012) * 0.02;
+  } else {
+    applyLocalVisual();
+  }
+  renderUI();
+  updateLabels();
+  renderer.render(scene, activeCamera);
+}
+animate();
+
+window.addEventListener("resize", function () {
+  var aspect = window.innerWidth / window.innerHeight;
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
+  phoneCamera.aspect = aspect;
+  phoneCamera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});

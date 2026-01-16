@@ -1,3 +1,5 @@
 certs/*.pem
 .venv
 node_modules
+test/*.pem
+test/*.json

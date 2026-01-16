@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Phone Twins</title>
+  <style>
+    :root{
+      --bg:#000;
+      --fg:#fff;
+      --muted:rgba(255,255,255,.7);
+      --line:rgba(255,255,255,.14);
+      --card:rgba(0,0,0,.65);
+      --accent:#ffae00;
+      --pill:rgba(255,255,255,.07);
+      --pill2:rgba(255,174,0,.16);
+      --shadow: 0 10px 40px rgba(0,0,0,.5);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font-family: var(--mono); }
+    #app { position: fixed; inset: 0; }
+    canvas { display:block; width:100%; height:100%; }
+    #menu {
+      position: fixed;
+      left: calc(env(safe-area-inset-left) + 10px);
+      top:  calc(env(safe-area-inset-top) + 10px);
+      z-index: 10;
+      pointer-events: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: min(520px, calc(100vw - 20px));
+      user-select: none;
+    }
+    .row { display:flex; gap:8px; align-items:center; }
+    .btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      color: var(--fg);
+      padding: 9px 10px;
+      border-radius: 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .2px;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn.accent {
+      border-color: rgba(255,174,0,.55);
+      background: rgba(255,174,0,.14);
+      color: var(--fg);
+    }
+    .btn.icon {
+      width: 38px; padding: 9px 0;
+      display:flex; align-items:center; justify-content:center;
+      font-weight: 800;
+    }
+    #panel {
+      backdrop-filter: blur(10px);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      box-shadow: var(--shadow);
+    }
+    .module {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: rgba(255,255,255,.03);
+    }
+    .moduleTitle{
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      letter-spacing: .3px;
+      display:flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .peerBlock { margin-bottom: 8px; }
+    .peerBlock:last-child { margin-bottom: 0; }
+    .peerHeader {
+      font-size: 12px;
+      margin-bottom: 6px;
+      display:flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+    .pillbox{ display:flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .pill{
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: var(--pill);
+      white-space: nowrap;
+    }
+    .pill.accent{ border-color: rgba(255,174,0,.55); background: var(--pill2); }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 11px; line-height: 1.25; }
+    #menu.collapsed #panel { display:none; }
+    .label {
+      position: fixed;
+      transform: translate(-50%, -120%);
+      pointer-events: none;
+      padding: 6px 8px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      font-size: 11px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="menu">
+    <div class="row">
+      <button id="menuBtn" class="btn icon" title="Expand / collapse menu">≡</button>
+      <button id="streamBtn" class="btn accent" title="Start/stop streaming">Start streaming</button>
+      <button id="sphereBtn" class="btn" title="Toggle plane/sphere projection">Project to sphere</button>
+      <button id="camBtn" class="btn" title="Toggle phone camera">Phone camera</button>
+    </div>
+
+    <div id="panel">
+      <div class="module" style="margin-bottom:8px;">
+        <div class="moduleTitle">
+          <span>Peers</span>
+          <span id="peerCount" class="muted">0</span>
+        </div>
+        <div id="peersUI"></div>
+      </div>
+
+      <div class="module" style="margin-bottom:8px;">
+        <div class="moduleTitle"><span>You</span><span id="meId" class="muted">-</span></div>
+        <div class="pillbox" id="selfPills"></div>
+      </div>
+
+      <div class="module" style="margin-bottom:8px;">
+        <div class="moduleTitle"><span>Yaw</span><span class="muted">manual calibration</span></div>
+        <div class="row" style="justify-content:flex-start;">
+          <button id="calBtn" class="btn" title="Align yaw once to current compass heading">Calibrate</button>
+          <button id="calResetBtn" class="btn" title="Clear yaw offset">Reset</button>
+        </div>
+        <div class="tiny muted" style="margin-top:8px;">
+          No automatic compass fusion. Click Calibrate to align yaw once, then run on IMU only.
+        </div>
+      </div>
+
+      <div class="module" style="margin-bottom:8px;">
+        <div class="moduleTitle"><span>Sphere</span><span class="muted">tangent frame</span></div>
+        <div class="row" style="justify-content:flex-start;">
+          <button id="pickBtn" class="btn" title="Pick an anchor point on the sphere">Pick point</button>
+          <button id="gpsBtn" class="btn" title="Use your current GPS to place the anchor">Use GPS</button>
+        </div>
+        <div class="tiny muted" style="margin-top:8px;">
+          Sphere mode: up = (center->point). North = (+Y pole projected to tangent). Hold Shift and tap globe to pick.
+        </div>
+      </div>
+
+      <div class="module">
+        <div class="moduleTitle"><span>Info</span><span id="wsUrl" class="muted"></span></div>
+        <div id="share" class="tiny muted"></div>
+        <div id="status" class="tiny muted" style="margin-top:8px;">Not connected.</div>
+      </div>
+
+      <div class="tiny muted" style="margin-top:8px;">
+        iOS requires a trusted HTTPS context for motion + compass + geolocation.
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="module.js"></script>
+</body>
+</html>
